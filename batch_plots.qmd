@@ -1,0 +1,297 @@
+---
+title: "Interactive batch effects"
+format: html
+editor: visual
+---
+
+## Interactivly explore batch effects in single cell data
+
+Show case how different batch effects can manifest in single cell data
+
+## Data and libs
+
+```{r}
+suppressPackageStartupMessages({
+  library(purrr)
+  library(dplyr)
+  library(gridExtra)
+  library(ggpubr)
+  library(tidyr)
+  library(hrbrthemes)
+  library(magrittr)
+  library(RColorBrewer)
+  library(plotly)
+  library(stringr)
+  library(htmlwidgets)
+})
+
+set.seed(1234)
+```
+
+Simulate some single cell data from multiple cell types and batches, following the example of [ConfoundingExplorer](#0)
+
+Generate matrix and type vector
+
+```{r}
+nb1c1 <- 100
+nb1c2 <- 100
+nb2c1 <- 100
+nb2c2 <- 100
+n_sam <- nb1c1 + nb1c2 + nb2c1 + nb2c2
+nvar <- 20
+
+# effect sizes
+cond_eff <- 2.5
+batch_eff <- 1.8
+unknown_eff <- 0
+
+m <- matrix(stats::rnorm(n = (nb1c1 + nb1c2 + nb2c1 + nb2c2) * nvar,
+                             mean = 10, sd = 2),
+                nrow = nvar, dimnames = list(
+                    paste0("V", seq_len(nvar)),
+                    paste0("S", seq_len(nb1c1 + nb1c2 + nb2c1 + nb2c2))))
+
+cond <- c(rep("C1", nb1c1), rep("C2", nb1c2),
+              rep("C1", nb2c1), rep("C2", nb2c2))
+batch <- c(rep("B1", nb1c1), rep("B1", nb1c2),
+              rep("B2", nb2c1), rep("B2", nb2c2))
+unknown <- rep(c("U1", "U2"), n_sam/2)
+
+
+```
+
+```{r}
+
+#Function to add effects
+
+simData <- function(m, cond, batch, unknown, condeffect, batcheffect, unknowneffect,
+                          batchtype, nvar) {
+    condsign <- rep("0", nvar)
+    condsign_num <- rep(c(1, -1), nvar/2)
+    batchvar <- seq.int(from = 1, to = 20, by = 2)
+    batchsign <- rep(0, nvar)
+    batchsign_num <- rep(0, nvar)
+    batchsign_num[batchvar] <- rep(c(1,-1), length(batchvar)/2)
+    unknownvar <- 1:10
+    unknownsign <- rep(0, nvar)
+    unknownsign_num <- rep(0, nvar)
+    unknownsign_num[unknownvar] <- rep(c(1,-1), length(unknownvar)/2)
+    for (i in 1:nvar) {
+        sgn <- condsign_num[i]
+        m[i, cond == "C2"] <- m[i, cond == "C2"] + sgn * condeffect
+        condsign[i] <- ifelse(sgn == 1, "pos", "neg")
+    }
+    for (i in batchvar) {
+      sgn <- batchsign_num[i]
+        if (batchtype == "linear") {
+            m[i, batch == "B2"] <- m[i, batch == "B2"] + sgn * batcheffect
+        } else if (batchtype == "interactive") {
+            m[i, batch == "B2"] <- m[i, batch == "B2"] + sgn * batcheffect
+            m[i, batch == "B2" & cond == "C2"] <- m[i, batch == "B2" & cond == "C2"] + 
+              sgn * batcheffect * condsign_num[i] * condeffect
+        } else if (batchtype == "cellwise") {
+            m[i, ] <- m[i, ] + sgn * batcheffect * batch
+        }
+      batchsign[i] <- ifelse(sgn == 1, "pos", "neg")
+    }
+    for (i in unknownvar) {
+        sgn <- unknownsign_num[i]
+        m[i, unknown == "U2"] <- m[i, unknown == "U2"] + sgn * unknowneffect
+        unknownsign[i] <- ifelse(sgn == 1, "pos", "neg")
+    }
+    res <- data.frame(feature = rownames(m),
+                      batchaff = seq_len(nvar) %in% batchvar,
+                      batchsign = batchsign,
+                      condsign = condsign,
+                      unknownaff = seq_len(nvar) %in% unknownvar,
+                      unknownsign = unknownsign,
+                      #p.val = pvals,
+                      #p.adj = stats::p.adjust(pvals, method = "BH"),
+                      row.names = rownames(m))
+    annot <- data.frame(sample = colnames(m), batch = batch, cond = cond,
+                        unknown = unknown, row.names = colnames(m))
+    return(list(m = m, res = res, annot = annot))
+}
+
+
+int_dat <- simData(m = m,
+                   batch = batch,
+                   cond = cond,
+                   unknown = unknown, 
+                   condeffect = cond_eff, 
+                   batcheffect = batch_eff,
+                   unknowneffect = unknown_eff,
+                   batchtype = "interactive", 
+                   nvar = 20)
+
+cw_dat <- simData(m = m,
+                   batch = batch,
+                   cond = cond,
+                   unknown = unknown, 
+                   condeffect = cond_eff, 
+                   batcheffect = batch_eff, 
+                   unknowneffect = unknown_eff,
+                   batchtype = "cw", 
+                   nvar = 20)
+
+lin_dat <- simData(m = m,
+                   batch = batch,
+                   cond = cond,
+                   unknown = unknown, 
+                   condeffect = cond_eff, 
+                   batcheffect = batch_eff,
+                   unknowneffect = unknown_eff,
+                   batchtype = "linear", 
+                   nvar = 20)
+
+
+none_dat <- simData(m = m,
+                   batch = batch,
+                   cond = cond,
+                   unknown = unknown, 
+                   condeffect = cond_eff, 
+                   batcheffect = 0,
+                   unknowneffect = unknown_eff,
+                   batchtype = "interactive", 
+                   nvar = 20)
+```
+
+#### Expression table
+
+```{r}
+
+get_gene <- function(gene_nam){
+   gen_dat <- data.frame("none" = none_dat$m[gene_nam,],
+                         "linear" = lin_dat$m[gene_nam,], 
+                         "interacting" = int_dat$m[gene_nam,])
+                         #"cellwise" = cw_dat$m[gene_nam,])
+   gen_all <- cbind(gen_dat, lin_dat$annot)
+   gen_all$cond <- as.factor(gen_all$cond)
+   gen_long <- pivot_longer(gen_all, 
+                            cols = c("none", "linear", "interacting"),
+                            names_to = "batch_type")
+   gen_long$batch_type <- factor(gen_long$batch_type, 
+                                 levels = c("none", "linear", "interacting"))
+   gen_long
+}
+
+gene_no_cond <- get_gene("V13")
+gene_one_ct <- gene_no_cond %>% filter(cond %in% "C1") %>% filter(!batch_type %in% "interacting")
+gene_no_batch <- get_gene("V12")
+
+```
+
+## Plotly plots
+
+### Two cell types and batch
+
+```{r}
+
+p <- ggplot(gene_no_cond, aes(x=batch, y=value,fill= batch, group = batch, frame = batch_type)) +
+    geom_boxplot() +
+    geom_jitter(aes(color = batch)) +
+    scale_fill_manual(name ='batch',
+                      values =c('B1'=alpha("blue", .3), 'B2'=alpha("red", .3))) +
+    scale_color_manual(name = "batch",
+                        values = c("blue", "red")) +
+    theme_bw() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=15)
+    ) + 
+  facet_wrap(~cond) +
+  ggtitle("Cell type marker gene") +
+  xlab("cell type") +
+  ylab("gene expression")
+
+
+fig2 <- plotly::ggplotly(p)
+fig2
+
+saveWidget(fig2, "ct_and_batch.html")
+
+```
+
+```{r}
+#aes(fill=cond)
+
+p <- ggplot(gene_no_cond, aes(x=cond, y=value,fill= batch, group = batch, frame = batch_type)) +
+    geom_boxplot() +
+    #geom_jitter(aes(color = batch)) +
+    scale_fill_manual(name ='batch',
+                      values =c('B1'=alpha("blue", .3), 'B2'=alpha("red", .3))) +
+    scale_color_manual(name = "batch",
+                        values = c("blue", "red")) +
+    theme_bw() +
+    theme(
+      #legend.position="none",
+      plot.title = element_text(size=15)
+    ) + 
+  ggtitle("Cell type marker gene") +
+  xlab("cell type") +
+  ylab("gene expression")
+
+
+fig <- plotly::ggplotly(p) %>% layout(boxmode = "group", stackgroup = "marker")
+
+for (i in 1:length(fig$x$data)){
+    if (!is.null(fig$x$data[[i]]$name)){
+        fig$x$data[[i]]$name =  gsub("\\(","",str_split(fig$x$data[[i]]$name,",")[[1]][1])
+    }
+}
+
+fig
+```
+
+#### One cell type
+
+```{r}
+
+p <- ggplot(gene_one_ct, aes(x=batch, y=value,fill= batch, group = batch, frame = batch_type)) +
+    geom_boxplot() +
+    geom_jitter(aes(color = batch)) +
+    scale_fill_manual(name ='batch',
+                      values =c('B1'=alpha("blue", .3), 'B2'=alpha("red", .3))) +
+    scale_color_manual(name = "batch",
+                        values = c("blue", "red")) +
+    theme_bw() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=15)
+    ) + 
+  facet_wrap(~cond) +
+  ggtitle("Gene expression") +
+  xlab("cell type") +
+  ylab("gene expression")
+
+
+fig3 <- plotly::ggplotly(p)
+fig3
+saveWidget(fig3, "no_ct_and_batch.html")
+```
+
+#### Two cell types no batch
+
+```{r}
+p <- ggplot(gene_no_batch, aes(x=batch, y=value, frame = batch_type)) +
+    geom_boxplot(aes(fill=batch)) +
+    scale_fill_manual(name ='batch',
+                      values =c('B1'=alpha("blue", .3), 'B2'=alpha("red", .3))) +
+    geom_jitter(aes(color = batch), size=1.2, alpha=1) +
+    scale_color_manual(name = "batch",
+                        values = c("blue", "red")) +
+    theme_bw() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=15)
+    ) + 
+  facet_wrap(~cond) +
+  ggtitle("Cell type marker gene no batch effect") +
+  xlab("cell type") +
+  ylab("gene expression")
+
+
+fig <- ggplotly(p)
+
+fig
+```
